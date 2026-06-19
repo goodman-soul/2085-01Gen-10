@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>鲜奶取货柜系统 - 控制台</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { background-color: #f5f7fb; }
+    .sidebar { min-height: 100vh; background: linear-gradient(180deg, #667eea 0%, #764ba2 100%); }
+    .sidebar .nav-link { color: rgba(255,255,255,0.85); padding: 12px 20px; border-radius: 8px; margin-bottom: 4px; }
+    .sidebar .nav-link:hover, .sidebar .nav-link.active { background: rgba(255,255,255,0.15); color: white; }
+    .sidebar .nav-link i { margin-right: 10px; width: 20px; display: inline-block; text-align: center; }
+    .card { border: none; box-shadow: 0 2px 8px rgba(0,0,0,0.06); border-radius: 12px; }
+    .stat-card { background: linear-gradient(135deg, var(--c1), var(--c2)); color: white; }
+    .stat-card .display-6 { font-weight: 700; }
+    .btn-primary { background: linear-gradient(135deg, #667eea, #764ba2); border: none; }
+    .locker-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 10px; }
+    .locker-box { aspect-ratio: 1; border-radius: 10px; display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; transition: all 0.2s; border: 2px solid transparent; }
+    .locker-box:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+    .locker-empty { background: #dcfce7; color: #166534; }
+    .locker-occupied { background: #dbeafe; color: #1e40af; }
+    .locker-reserved { background: #fef3c7; color: #92400e; }
+    .locker-maintenance { background: #fee2e2; color: #991b1b; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+<div class="container-fluid">
+  <div class="row">
+    <div class="col-2 sidebar p-3">
+      <div class="text-white mb-4 p-3">
+        <h4 class="mb-0">🥛 鲜奶取货柜</h4>
+        <small class="opacity-75">智能管理系统</small>
+      </div>
+      <nav class="nav flex-column" id="navMenu"></nav>
+      <div class="mt-auto pt-4">
+        <div class="text-white-50 small mb-2">当前用户</div>
+        <div class="text-white" id="userInfo"></div>
+        <button class="btn btn-outline-light btn-sm w-100 mt-3" onclick="logout()">退出登录</button>
+      </div>
+    </div>
+    <div class="col-10 p-4">
+      <div id="contentArea"></div>
+    </div>
+  </div>
+</div>
+
+<div class="modal fade" id="modal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header"><h5 class="modal-title" id="modalTitle"></h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-footer" id="modalFooter"></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<script src="app.js"></script>
+<script>
+const user = getUser();
+if (!user) window.location.href = 'index.html';
+
+document.getElementById('userInfo').innerHTML = `<strong>${user.name}</strong><br><small>${user.role === 'delivery' ? '配送员' : user.role === 'resident' ? '住户' : '物业管理员'}</small>`;
+
+const NAVS = {
+  delivery: [
+    { id: 'overview', icon: '📊', label: '总览' },
+    { id: 'batches', icon: '📦', label: '配送批次' },
+    { id: 'lockers', icon: '🗄️', label: '格口管理' },
+    { id: 'exceptions', icon: '⚠️', label: '异常处理' }
+  ],
+  resident: [
+    { id: 'overview', icon: '🏠', label: '我的首页' },
+    { id: 'pickup', icon: '🛒', label: '取货' },
+    { id: 'subscriptions', icon: '📋', label: '订奶管理' },
+    { id: 'bills', icon: '💰', label: '账单记录' }
+  ],
+  property: [
+    { id: 'overview', icon: '📊', label: '数据总览' },
+    { id: 'daily-report', icon: '📈', label: '每日报表' },
+    { id: 'exceptions', icon: '⚠️', label: '异常处理' },
+    { id: 'lockers', icon: '🗄️', label: '格口状态' },
+    { id: 'inventory', icon: '📦', label: '库存记录' },
+    { id: 'settlements', icon: '💰', label: '结算记录' }
+  ]
+};
+
+const PAGES = {};
+let currentNav = 'overview';
+
+function renderNav() {
+  const nav = NAVS[user.role] || [];
+  document.getElementById('navMenu').innerHTML = nav.map(n => 
+    `<a class="nav-link ${n.id === currentNav ? 'active' : ''}" onclick="switchNav('${n.id}')"><i>${n.icon}</i>${n.label}</a>`
+  ).join('');
+}
+
+function switchNav(id) {
+  currentNav = id;
+  renderNav();
+  renderPage();
+}
+
+async function renderPage() {
+  const fn = PAGES[currentNav];
+  if (fn) await fn();
+}
+
+PAGES.overview = async function() {
+  const area = document.getElementById('contentArea');
+  if (user.role === 'delivery') {
+    const [batches, lockers] = await Promise.all([api.getBatches(user.id), api.getLockers()]);
+    const inProgress = batches.batches.filter(b => b.status === 'in_progress').length;
+    const occupied = lockers.lockers.filter(l => l.status === 'occupied').length;
+    const empty = lockers.lockers.filter(l => l.status === 'empty').length;
+    const exc = (await api.getExceptions('pending')).exceptions.length;
+    
+    area.innerHTML = `
+      <h3 class="mb-4">欢迎，${user.name}！</h3>
+      <div class="row g-3 mb-4">
+        ${statCard('进行中批次', inProgress, '#667eea', '#764ba2')}
+        ${statCard('占用格口', occupied, '#f59e0b', '#ef4444')}
+        ${statCard('空闲格口', empty, '#10b981', '#059669')}
+        ${statCard('待处理异常', exc, '#ef4444', '#dc2626')}
+      </div>
+      <div class="card p-4">
+        <h5 class="mb-3">📦 最近配送批次</h5>
+        <table class="table">
+          <thead><tr><th>批次号</th><th>日期</th><th>总数</th><th>已投放</th><th>状态</th></tr></thead>
+          <tbody>${batches.batches.slice(0, 5).map(b => `<tr><td>${b.batch_no}</td><td>${b.batch_date}</td><td>${b.total_quantity}</td><td>${b.delivered_quantity}</td><td>${statusBadge(b.status)}</td></tr>`).join('')}</tbody>
+        </table>
+      </div>`;
+  } else if (user.role === 'resident') {
+    const [items, subs, bills] = await Promise.all([
+      api.getPickupItems(user.id), api.getSubscriptions(user.id), api.getSettlements(user.id)
+    ]);
+    const activeSubs = subs.subscriptions.filter(s => s.status === 'active').length;
+    const pendingAmount = bills.settlements.filter(s => s.status === 'pending').reduce((a, b) => a + b.amount, 0);
+    
+    area.innerHTML = `
+      <h3 class="mb-4">你好，${user.name}！${user.address ? `<small class="text-muted ms-2">${user.address}</small>` : ''}</h3>
+      <div class="row g-3 mb-4">
+        ${statCard('待取商品', items.items.length, '#667eea', '#764ba2')}
+        ${statCard('有效订奶', activeSubs, '#10b981', '#059669')}
+        ${statCard('待结算金额', '¥' + pendingAmount.toFixed(2), '#f59e0b', '#ef4444')}
+      </div>
+      ${items.items.length ? `
+        <div class="card p-4 mb-4">
+          <h5 class="mb-3">🛒 待取商品</h5>
+          <div class="row g-3">${items.items.map(it => `
+            <div class="col-md-4">
+              <div class="card p-3 border-primary">
+                <div class="fw-bold">${it.product_name}</div>
+                <div class="small text-muted">${it.brand} · ${it.spec} × ${it.quantity}</div>
+                <div class="mt-2"><span class="badge bg-primary">格口 ${it.locker_code}</span></div>
+                <div class="small mt-1">取货码: <code class="fw-bold text-danger">${it.pickup_code}</code></div>
+                <div class="small text-muted">过期: ${it.expire_at}</div>
+              </div>
+            </div>`).join('')}
+          </div>
+        </div>` : '<div class="card p-5 text-center text-muted">暂无待取商品</div>'}
+    `;
+  } else if (user.role === 'property') {
+    const report = (await api.getDailyReport()).report;
+    const exc = (await api.getExceptions()).exceptions;
+    const pendingExc = exc.filter(e => e.status === 'pending').length;
+    
+    area.innerHTML = `
+      <h3 class="mb-4">每日总览 - ${report.date}</h3>
+      <div class="row g-3 mb-4">
+        ${statCard('总配送量', report.total_delivered, '#667eea', '#764ba2')}
+        ${statCard('已取货', report.total_picked, '#10b981', '#059669')}
+        ${statCard('临期未取', report.total_expired, '#f59e0b', '#d97706')}
+        ${statCard('破损/错拿', report.total_damaged + report.total_wrong_pick, '#ef4444', '#dc2626')}
+        ${statCard('补送', report.total_re_delivered, '#3b82f6', '#2563eb')}
+        ${statCard('退款/退订', report.total_refunded, '#8b5cf6', '#7c3aed')}
+      </div>
+      <div class="row g-3">
+        <div class="col-md-6">
+          <div class="card p-4">
+            <h5 class="mb-3">📦 剩余奶品去向</h5>
+            ${report.remaining_products.length ? `
+              <table class="table table-sm">
+                <thead><tr><th>商品</th><th>住户</th><th>数量</th><th>格口</th><th>状态</th></tr></thead>
+                <tbody>${report.remaining_products.map(r => `<tr><td>${r.product_name}</td><td>${r.resident_name}</td><td>${r.quantity}</td><td>${r.locker_code || '-'}</td><td>${statusBadge(r.status)}</td></tr>`).join('')}</tbody>
+              </table>` : '<div class="text-muted text-center py-3">无剩余奶品</div>'}
+          </div>
+        </div>
+        <div class="col-md-6">
+          <div class="card p-4">
+            <h5 class="mb-3">⚠️ 异常情况</h5>
+            ${report.exception_details.length ? `
+              <table class="table table-sm">
+                <thead><tr><th>类型</th><th>商品</th><th>住户</th><th>库存影响</th><th>金额</th></tr></thead>
+                <tbody>${report.exception_details.map(e => `<tr><td>${exceptionTypeBadge(e.type)}</td><td>${e.product_name}</td><td>${e.resident_name}</td><td>${e.impact_inventory}</td><td>¥${e.impact_settlement.toFixed(2)}</td></tr>`).join('')}</tbody>
+              </table>` : '<div class="text-muted text-center py-3">无异常记录</div>'}
+          </div>
+        </div>
+      </div>
+      <div class="mt-3 text-center">
+        <button class="btn btn-warning me-2" onclick="checkExpiredNow()">🔍 检查临期商品</button>
+        <button class="btn btn-primary" onclick="switchNav('daily-report')">查看完整报表 →</button>
+      </div>`;
+  }
+};
+
+function statCard(label, value, c1, c2) {
+  return `<div class="col-md-3"><div class="card stat-card p-4" style="--c1:${c1};--c2:${c2}"><div class="small opacity-80">${label}</div><div class="display-6 mt-1">${value}</div></div></div>`;
+}
+
+async function checkExpiredNow() {
+  const r = await api.checkExpired();
+  alert(`已检查，发现并处理 ${r.expired_count} 个临期商品`);
+  renderPage();
+}
+
+PAGES.batches = async function() {
+  const area = document.getElementById('contentArea');
+  const data = await api.getBatches(user.id);
+  area.innerHTML = `
+    <div class="d-flex justify-content-between align-items-center mb-4">
+      <h3>📦 配送批次管理</h3>
+      <button class="btn btn-primary" onclick="createBatchModal()">+ 新建批次</button>
+    </div>
+    <div class="card p-4">
+      <table class="table">
+        <thead><tr><th>批次号</th><th>日期</th><th>配送员</th><th>总数</th><th>已投放</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody>${data.batches.map(b => `<tr>
+          <td class="fw-bold">${b.batch_no}</td>
+          <td>${b.batch_date}</td>
+          <td>${b.delivery_person_name}</td>
+          <td>${b.total_quantity}</td>
+          <td>${b.delivered_quantity}</td>
+          <td>${statusBadge(b.status)}</td>
+          <td><button class="btn btn-sm btn-outline-primary" onclick="viewBatch(${b.id})">查看详情</button></td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </div>`;
+};
+
+function createBatchModal() {
+  showModal('新建配送批次', `
+    <div class="mb-3"><label class="form-label">配送日期</label>
+      <input type="date" id="batchDate" class="form-control" value="${todayStr()}"></div>
+  `, [
+    { label: '取消', cls: 'secondary' },
+    { label: '创建批次', cls: 'primary', onClick: async () => {
+        const r = await api.createBatch({ delivery_person_id: user.id, batch_date: document.getElementById('batchDate').value });
+        if (r.success) { hideModal(); alert('创建成功，共生成 ' + r.total_items + ' 个配送项'); renderPage(); }
+    }}
+  ]);
+}
+
+async function viewBatch(batchId) {
+  const data = await api.getBatchItems(batchId);
+  const area = document.getElementById('contentArea');
+  const emptyLockers = (await api.getEmptyLockers()).lockers;
+  
+  area.innerHTML = `
+    <div class="d-flex justify-content-between align-items-center mb-4">
+      <h3>📦 批次详情</h3>
+      <button class="btn btn-outline-secondary" onclick="switchNav('batches')">← 返回列表</button>
+    </div>
+    <div class="card p-4 mb-3">
+      <div class="d-flex gap-4 flex-wrap">
+        <div><span class="text-muted">待投放:</span> <strong class="text-danger">${data.items.filter(i => i.status === 'pending').length}</strong></div>
+        <div><span class="text-muted">已投放:</span> <strong class="text-success">${data.items.filter(i => i.status === 'placed').length}</strong></div>
+        <div><span class="text-muted">已取货:</span> <strong class="text-primary">${data.items.filter(i => i.status === 'picked').length}</strong></div>
+        <div><span class="text-muted">异常:</span> <strong>${data.items.filter(i => ['expired', 'damaged', 'wrong_pick'].includes(i.status)).length}</strong></div>
+      </div>
+    </div>
+    <div class="card p-4">
+      <table class="table table-sm">
+        <thead><tr><th>商品</th><th>住户</th><th>地址</th><th>数量</th><th>取货码</th><th>格口</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody>${data.items.map(it => `<tr>
+          <td>${it.product_name}<br><small class="text-muted">${it.brand} ${it.spec}</small></td>
+          <td>${it.resident_name}<br><small class="text-muted">${it.phone}</small></td>
+          <td><small>${it.address}</small></td>
+          <td>${it.quantity}</td>
+          <td><code class="fw-bold">${it.pickup_code}</code></td>
+          <td>${it.locker_code || '-'}</td>
+          <td>${statusBadge(it.status)}</td>
+          <td>${it.status === 'pending' ? `<button class="btn btn-sm btn-success" onclick="placeItem(${it.id}, ${JSON.stringify(emptyLockers.map(l => ({id:l.id,code:l.locker_code})))})">投放</button>` : '-'}</td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </div>`;
+}
+
+function placeItem(itemId, lockers) {
+  showModal('选择格口投放', `
+    <div class="mb-3"><label class="form-label">选择空闲格口</label>
+      <select id="lockerSelect" class="form-select">${lockers.map(l => `<option value="${l.id}">${l.code}</option>`).join('')}</select>
+    </div>
+  `, [
+    { label: '取消', cls: 'secondary' },
+    { label: '确认投放', cls: 'primary', onClick: async () => {
+        const lockerId = document.getElementById('lockerSelect').value;
+        const r = await api.placeBatchItem(itemId, parseInt(lockerId));
+        if (r.success) { hideModal(); alert('投放成功'); const currentBatchMatch = window.location.hash.match(/batch=(\d+)/); renderPage(); }
+        else alert(r.message);
+    }}
+  ]);
+}
+
+PAGES.lockers = async function() {
+  const area = document.getElementById('contentArea');
+  const data = await api.getLockers();
+  const stats = { empty: 0, occupied: 0, reserved: 0, maintenance: 0 };
+  data.lockers.forEach(l => stats[l.status]++);
+  
+  area.innerHTML = `
+    <h3 class="mb-4">🗄️ 格口状态监控</h3>
+    <div class="card p-4 mb-4">
+      <div class="d-flex gap-5 flex-wrap">
+        <div>空闲格口: <strong class="text-success">${stats.empty}</strong></div>
+        <div>占用中: <strong class="text-primary">${stats.occupied}</strong></div>
+        <div>预留: <strong class="text-warning">${stats.reserved}</strong></div>
+        <div>维护中: <strong class="text-danger">${stats.maintenance}</strong></div>
+      </div>
+    </div>
+    <div class="card p-4">
+      <div class="locker-grid">${data.lockers.map(l => `
+        <div class="locker-box locker-${l.status}" onclick="showLockerDetail(${JSON.stringify(l).replace(/"/g, '&quot;')})">
+          <div class="fw-bold fs-5">${l.locker_code}</div>
+          <div class="small">${l.status === 'empty' ? '空闲' : l.status === 'occupied' ? '占用' : l.status}</div>
+          ${l.resident_name ? `<div class="small mt-1 text-truncate" style="max-width:85px">${l.product_name}</div>` : ''}
+        </div>`).join('')}
+      </div>
+    </div>`;
+};
+
+function showLockerDetail(l) {
+  let content = `<div><p><strong>格口号:</strong> ${l.locker_code}</p><p><strong>位置:</strong> ${l.location || '-'}</p><p><strong>状态:</strong> ${lockerStatusBadge(l.status)}</p>`;
+  if (l.product_name) {
+    content += `<hr><p><strong>商品:</strong> ${l.product_name}</p><p><strong>住户:</strong> ${l.resident_name || '-'}</p>`;
+  }
+  showModal('格口详情 - ' + l.locker_code, content, [{ label: '关闭', cls: 'secondary' }]);
+}
+
+PAGES.pickup = async function() {
+  const area = document.getElementById('contentArea');
+  const data = await api.getPickupItems(user.id);
+  
+  area.innerHTML = `
+    <h3 class="mb-4">🛒 我的取货</h3>
+    ${data.items.length ? `
+    <div class="row g-3">${data.items.map(it => `
+      <div class="col-md-6">
+        <div class="card p-4">
+          <div class="d-flex justify-content-between align-items-start mb-2">
+            <div>
+              <h5 class="mb-1">${it.product_name}</h5>
+              <div class="text-muted small">${it.brand} · ${it.spec} × ${it.quantity}</div>
+            </div>
+            <span class="badge bg-primary fs-6">格口 ${it.locker_code}</span>
+          </div>
+          <div class="alert alert-light py-2 mb-2">
+            <div class="small text-muted">取货码</div>
+            <div class="fs-2 fw-bold text-center text-danger" style="letter-spacing: 8px;">${it.pickup_code}</div>
+          </div>
+          <div class="small text-muted mb-3">
+            <div>批次: ${it.batch_no} (${it.batch_date})</div>
+            <div>放入时间: ${it.placed_at}</div>
+            <div>过期时间: <span class="text-danger fw-bold">${it.expire_at}</span></div>
+          </div>
+          <div class="d-flex gap-2">
+            <input type="text" id="code-${it.id}" class="form-control form-control-sm" placeholder="输入取货码">
+            <button class="btn btn-primary btn-sm" onclick="doPickup(${it.id}, '${it.pickup_code}')">确认取货</button>
+          </div>
+          <button class="btn btn-outline-danger btn-sm mt-2" onclick="reportDamagedModal(${it.id})">商品破损？上报</button>
+        </div>
+      </div>`).join('')}
+    </div>` : '<div class="card p-5 text-center text-muted"><div class="display-4 mb-3">📭</div>当前没有待取商品</div>'}`;
+};
+
+async function doPickup(itemId, correctCode) {
+  const code = document.getElementById('code-' + itemId).value.trim();
+  if (!code) { alert('请输入取货码'); return; }
+  const r = await api.pickup({ batch_item_id: itemId, resident_id: user.id, pickup_code: code });
+  if (r.success) {
+    if (r.wrong_pick) alert('取货码错误或非本人商品！已记录异常，请联系物业处理。');
+    else alert('取货成功！');
+    renderPage();
+  } else alert(r.message);
+}
+
+function reportDamagedModal(itemId) {
+  showModal('上报商品破损', `
+    <div class="mb-3"><label class="form-label">破损描述</label>
+      <textarea id="damagedDesc" class="form-control" rows="3" placeholder="请描述破损情况"></textarea>
+    </div>
+  `, [
+    { label: '取消', cls: 'secondary' },
+    { label: '确认上报', cls: 'danger', onClick: async () => {
+        const r = await api.reportDamaged({ batch_item_id: itemId, resident_id: user.id, description: document.getElementById('damagedDesc').value });
+        if (r.success) { hideModal(); alert('破损已上报，我们会尽快处理'); renderPage(); }
+    }}
+  ]);
+}
+
+PAGES.subscriptions = async function() {
+  const area = document.getElementById('contentArea');
+  const [subs, products] = await Promise.all([api.getSubscriptions(user.id), api.getProducts()]);
+  
+  area.innerHTML = `
+    <div class="d-flex justify-content-between align-items-center mb-4">
+      <h3>📋 我的订奶</h3>
+      <button class="btn btn-primary" onclick="newSubModal(${JSON.stringify(products.products).replace(/"/g, '&quot;')})">+ 新增订奶</button>
+    </div>
+    <div class="card p-4">
+      <table class="table">
+        <thead><tr><th>商品</th><th>数量</th><th>单价</th><th>开始日期</th><th>结束日期</th><th>配送日</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody>${subs.subscriptions.map(s => `<tr>
+          <td>${s.product_name}<br><small class="text-muted">${s.brand} ${s.spec}</small></td>
+          <td>${s.quantity}</td>
+          <td>¥${s.price.toFixed(2)}</td>
+          <td>${s.start_date}</td>
+          <td>${s.end_date || '长期'}</td>
+          <td>${formatWeekdays(s.weekdays)}</td>
+          <td>${statusBadge(s.status)}</td>
+          <td>${s.status === 'active' ? `<button class="btn btn-sm btn-outline-danger" onclick="cancelSub(${s.id})">退订</button>` : '-'}</td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </div>`;
+};
+
+function formatWeekdays(w) {
+  const names = ['', '一', '二', '三', '四', '五', '六', '日'];
+  return w.split(',').map(d => '周' + names[d]).join(' ');
+}
+
+function newSubModal(products) {
+  showModal('新增订奶', `
+    <div class="mb-3"><label class="form-label">选择商品</label>
+      <select id="subProduct" class="form-select">${products.map(p => `<option value="${p.id}" data-price="${p.price}">${p.name} - ${p.brand} ${p.spec} (¥${p.price.toFixed(2)})</option>`).join('')}</select>
+    </div>
+    <div class="mb-3"><label class="form-label">数量</label>
+      <input type="number" id="subQty" class="form-control" value="1" min="1">
+    </div>
+    <div class="mb-3"><label class="form-label">开始日期</label>
+      <input type="date" id="subStart" class="form-control" value="${todayStr()}">
+    </div>
+    <div class="mb-3"><label class="form-label">结束日期（不填则长期）</label>
+      <input type="date" id="subEnd" class="form-control">
+    </div>
+    <div class="mb-3">
+      <label class="form-label">配送日</label>
+      <div class="d-flex gap-2">
+        ${[1,2,3,4,5,6,7].map(d => {
+          const names = ['一','二','三','四','五','六','日'];
+          return `<div class="form-check"><input class="form-check-input" type="checkbox" id="wd-${d}" value="${d}" checked><label class="form-check-label" for="wd-${d}">周${names[d-1]}</label></div>`;
+        }).join('')}
+      </div>
+    </div>
+  `, [
+    { label: '取消', cls: 'secondary' },
+    { label: '确认订奶', cls: 'primary', onClick: async () => {
+        const product_id = document.getElementById('subProduct').value;
+        const quantity = parseInt(document.getElementById('subQty').value);
+        const start_date = document.getElementById('subStart').value;
+        const end_date = document.getElementById('subEnd').value;
+        const wds = [1,2,3,4,5,6,7].filter(d => document.getElementById('wd-' + d).checked).join(',');
+        if (!wds) { alert('请至少选择一个配送日'); return; }
+        const r = await api.createSubscription({ resident_id: user.id, product_id, quantity, start_date, end_date, weekdays: wds });
+        if (r.success) { hideModal(); alert('订奶成功！'); renderPage(); }
+    }}
+  ]);
+}
+
+async function cancelSub(id) {
+  if (!confirm('确定退订该订奶计划吗？')) return;
+  const r = await api.cancelSubscription(id);
+  if (r.success) { alert('退订成功，已生成退款'); renderPage(); }
+}
+
+PAGES.bills = async function() {
+  const area = document.getElementById('contentArea');
+  const data = await api.getSettlements(user.id);
+  area.innerHTML = `
+    <h3 class="mb-4">💰 我的账单</h3>
+    <div class="card p-4">
+      <table class="table">
+        <thead><tr><th>时间</th><th>类型</th><th>描述</th><th>金额</th><th>状态</th></tr></thead>
+        <tbody>${data.settlements.map(s => `<tr>
+          <td>${s.created_at}</td>
+          <td>${s.type === 'charge' ? '<span class="badge bg-danger">扣费</span>' : s.type === 'refund' ? '<span class="badge bg-success">退款</span>' : '<span class="badge bg-primary">补偿</span>'}</td>
+          <td>${s.description}</td>
+          <td class="fw-bold ${s.type === 'charge' ? 'text-danger' : 'text-success'}">${s.type === 'charge' ? '-' : '+'}¥${s.amount.toFixed(2)}</td>
+          <td>${statusBadge(s.status)}</td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </div>`;
+};
+
+PAGES.exceptions = async function() {
+  const area = document.getElementById('contentArea');
+  const data = await api.getExceptions();
+  area.innerHTML = `
+    <div class="d-flex justify-content-between align-items-center mb-4">
+      <h3>⚠️ 异常处理中心</h3>
+      <select class="form-select w-auto" id="excFilter" onchange="filterExceptions()">
+        <option value="">全部</option>
+        <option value="pending">待处理</option>
+        <option value="resolved">已处理</option>
+      </select>
+    </div>
+    <div class="card p-4">
+      <table class="table">
+        <thead><tr><th>时间</th><th>类型</th><th>商品</th><th>住户</th><th>格口</th><th>描述</th><th>库存影响</th><th>结算影响</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody id="excTbody">${renderExceptions(data.exceptions)}</tbody>
+      </table>
+    </div>`;
+};
+
+function renderExceptions(list) {
+  return list.map(e => `<tr>
+    <td>${e.created_at}</td>
+    <td>${exceptionTypeBadge(e.type)}</td>
+    <td>${e.product_name}</td>
+    <td>${e.resident_name}</td>
+    <td>${e.locker_code || '-'}</td>
+    <td><small>${e.description}</small></td>
+    <td class="${e.impact_inventory < 0 ? 'text-danger' : 'text-success'}">${e.impact_inventory}</td>
+    <td class="${e.impact_settlement > 0 ? 'text-danger' : 'text-success'}">¥${e.impact_settlement.toFixed(2)}</td>
+    <td>${statusBadge(e.status)}</td>
+    <td>${e.status === 'pending' ? `<button class="btn btn-sm btn-primary" onclick="resolveExceptionModal(${e.id}, '${e.type}')">处理</button>` : '-'}</td>
+  </tr>`).join('');
+}
+
+async function filterExceptions() {
+  const status = document.getElementById('excFilter').value;
+  const data = await api.getExceptions(status || undefined);
+  document.getElementById('excTbody').innerHTML = renderExceptions(data.exceptions);
+}
+
+function resolveExceptionModal(id, type) {
+  const actions = {
+    'damaged': [{ v: 're_deliver', l: '补送商品' }, { v: 'refund', l: '直接退款' }],
+    'wrong_pick': [{ v: 're_deliver', l: '补送商品' }, { v: 'refund', l: '退款处理' }],
+    'expired': [{ v: 'refund', l: '退款处理' }],
+    're_delivery': [{ v: 're_deliver', l: '确认已补送' }],
+    'refund': [{ v: 'refund', l: '确认退款' }]
+  };
+  const opts = actions[type] || [{ v: 'refund', l: '处理完成' }];
+  
+  showModal('处理异常', `
+    <div class="mb-3"><label class="form-label">处理方式</label>
+      <select id="resolveAction" class="form-select">${opts.map(o => `<option value="${o.v}">${o.l}</option>`).join('')}</select>
+    </div>
+    <div class="mb-3"><label class="form-label">备注</label>
+      <textarea id="resolveNotes" class="form-control" rows="2"></textarea>
+    </div>
+  `, [
+    { label: '取消', cls: 'secondary' },
+    { label: '确认处理', cls: 'primary', onClick: async () => {
+        const r = await api.resolveException(id, { handled_by: user.id, action: document.getElementById('resolveAction').value, notes: document.getElementById('resolveNotes').value });
+        if (r.success) { hideModal(); alert('处理完成'); renderPage(); }
+    }}
+  ]);
+}
+
+PAGES['daily-report'] = async function() {
+  const area = document.getElementById('contentArea');
+  const date = new URLSearchParams(window.location.search).get('date') || todayStr();
+  const data = await api.getDailyReport(date);
+  const r = data.report;
+  
+  area.innerHTML = `
+    <div class="d-flex justify-content-between align-items-center mb-4">
+      <h3>📈 每日报表 - ${r.date}</h3>
+      <div class="d-flex gap-2">
+        <input type="date" id="reportDate" class="form-control" value="${r.date}" onchange="changeReportDate()">
+      </div>
+    </div>
+    <div class="row g-3 mb-4">
+      ${statCard('总配送量', r.total_delivered, '#667eea', '#764ba2')}
+      ${statCard('正常取货', r.total_picked, '#10b981', '#059669')}
+      ${statCard('临期未取', r.total_expired, '#f59e0b', '#d97706')}
+      ${statCard('破损', r.total_damaged, '#ef4444', '#dc2626')}
+      ${statCard('错拿', r.total_wrong_pick, '#ef4444', '#b91c1c')}
+      ${statCard('补送', r.total_re_delivered, '#3b82f6', '#2563eb')}
+    </div>
+    <div class="row g-3 mb-4">
+      <div class="col-md-12">
+        <div class="card p-4">
+          <h5 class="mb-3">📦 剩余奶品去向 (${r.remaining_products.length})</h5>
+          ${r.remaining_products.length ? `
+            <table class="table table-sm">
+              <thead><tr><th>商品</th><th>住户</th><th>数量</th><th>格口</th><th>状态</th><th>过期时间</th></tr></thead>
+              <tbody>${r.remaining_products.map(p => `<tr>
+                <td>${p.product_name}</td><td>${p.resident_name}</td><td>${p.quantity}</td>
+                <td>${p.locker_code || '未投放'}</td><td>${statusBadge(p.status)}</td><td class="text-danger">${p.expire_at || '-'}</td>
+              </tr>`).join('')}</tbody>
+            </table>` : '<div class="text-muted text-center py-3">无剩余奶品</div>'}
+        </div>
+      </div>
+    </div>
+    <div class="row g-3 mb-4">
+      <div class="col-md-12">
+        <div class="card p-4">
+          <h5 class="mb-3">⚠️ 异常明细 (${r.exception_details.length})</h5>
+          ${r.exception_details.length ? `
+            <table class="table table-sm">
+              <thead><tr><th>类型</th><th>商品</th><th>住户</th><th>描述</th><th>库存影响</th><th>金额</th><th>状态</th></tr></thead>
+              <tbody>${r.exception_details.map(e => `<tr>
+                <td>${exceptionTypeBadge(e.type)}</td><td>${e.product_name}</td><td>${e.resident_name}</td>
+                <td><small>${e.description}</small></td>
+                <td class="${e.impact_inventory < 0 ? 'text-danger' : ''}">${e.impact_inventory}</td>
+                <td>¥${e.impact_settlement.toFixed(2)}</td><td>${statusBadge(e.status)}</td>
+              </tr>`).join('')}</tbody>
+            </table>` : '<div class="text-muted text-center py-3">无异常</div>'}
+        </div>
+      </div>
+    </div>
+    <div class="card p-4">
+      <h5 class="mb-3">💰 当日结算明细</h5>
+      ${r.settlements.length ? `
+        <table class="table table-sm">
+          <thead><tr><th>时间</th><th>住户</th><th>类型</th><th>金额</th><th>描述</th><th>状态</th></tr></thead>
+          <tbody>${r.settlements.map(s => `<tr>
+            <td>${s.created_at}</td><td>${s.resident_name}</td>
+            <td>${s.type === 'charge' ? '扣费' : s.type === 'refund' ? '退款' : '补偿'}</td>
+            <td class="fw-bold">¥${s.amount.toFixed(2)}</td><td>${s.description}</td><td>${statusBadge(s.status)}</td>
+          </tr>`).join('')}</tbody>
+        </table>` : '<div class="text-muted text-center py-3">无结算记录</div>'}
+    </div>`;
+};
+
+function changeReportDate() {
+  const d = document.getElementById('reportDate').value;
+  const url = new URL(window.location);
+  url.searchParams.set('date', d);
+  window.history.replaceState({}, '', url);
+  renderPage();
+}
+
+PAGES.inventory = async function() {
+  const area = document.getElementById('contentArea');
+  const data = await api.getInventoryLogs();
+  area.innerHTML = `
+    <h3 class="mb-4">📦 库存变动记录</h3>
+    <div class="card p-4">
+      <table class="table table-sm">
+        <thead><tr><th>时间</th><th>商品</th><th>变动类型</th><th>数量变化</th><th>备注</th></tr></thead>
+        <tbody>${data.logs.map(l => `<tr>
+          <td>${l.created_at}</td>
+          <td>${l.product_name}</td>
+          <td>${l.change_type}</td>
+          <td class="${l.change_quantity < 0 ? 'text-danger' : 'text-success'} fw-bold">${l.change_quantity > 0 ? '+' : ''}${l.change_quantity}</td>
+          <td><small>${l.notes}</small></td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </div>`;
+};
+
+PAGES.settlements = async function() {
+  const area = document.getElementById('contentArea');
+  const [data, residents] = await Promise.all([api.getSettlements(), api.getResidents()]);
+  area.innerHTML = `
+    <div class="d-flex justify-content-between align-items-center mb-4">
+      <h3>💰 结算记录</h3>
+      <select class="form-select w-auto" onchange="filterSettlements(this.value)">
+        <option value="">全部住户</option>
+        ${residents.residents.map(r => `<option value="${r.id}">${r.name}</option>`).join('')}
+      </select>
+    </div>
+    <div class="card p-4">
+      <table class="table">
+        <thead><tr><th>时间</th><th>住户</th><th>类型</th><th>金额</th><th>描述</th><th>状态</th></tr></thead>
+        <tbody id="setTbody">${data.settlements.map(s => `<tr>
+          <td>${s.created_at}</td>
+          <td>${s.resident_name}</td>
+          <td>${s.type === 'charge' ? '<span class="badge bg-danger">扣费</span>' : s.type === 'refund' ? '<span class="badge bg-success">退款</span>' : '<span class="badge bg-primary">补偿</span>'}</td>
+          <td class="fw-bold">¥${s.amount.toFixed(2)}</td>
+          <td>${s.description}</td>
+          <td>${statusBadge(s.status)}</td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </div>`;
+};
+
+async function filterSettlements(residentId) {
+  const data = await api.getSettlements(residentId || undefined);
+  document.getElementById('setTbody').innerHTML = data.settlements.map(s => `<tr>
+    <td>${s.created_at}</td>
+    <td>${s.resident_name}</td>
+    <td>${s.type === 'charge' ? '<span class="badge bg-danger">扣费</span>' : s.type === 'refund' ? '<span class="badge bg-success">退款</span>' : '<span class="badge bg-primary">补偿</span>'}</td>
+    <td class="fw-bold">¥${s.amount.toFixed(2)}</td>
+    <td>${s.description}</td>
+    <td>${statusBadge(s.status)}</td>
+  </tr>`).join('');
+}
+
+let modalObj = null;
+function showModal(title, bodyHtml, buttons = []) {
+  document.getElementById('modalTitle').textContent = title;
+  document.getElementById('modalBody').innerHTML = bodyHtml;
+  document.getElementById('modalFooter').innerHTML = buttons.map((b, i) => 
+    `<button class="btn btn-${b.cls}" onclick="modalBtnClick(${i})">${b.label}</button>`
+  ).join('');
+  window._modalButtons = buttons;
+  if (!modalObj) modalObj = new bootstrap.Modal(document.getElementById('modal'));
+  modalObj.show();
+}
+function modalBtnClick(i) {
+  const btn = window._modalButtons[i];
+  if (btn && btn.onClick) btn.onClick();
+  else hideModal();
+}
+function hideModal() { if (modalObj) modalObj.hide(); }
+
+renderNav();
+renderPage();
+</script>
+</body>
+</html>
