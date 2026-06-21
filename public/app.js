@@ -1,34 +1,62 @@
 const API_BASE = '/api';
 
+const TOKEN_KEY = 'auth_token';
+
+function getToken() {
+  return localStorage.getItem(TOKEN_KEY);
+}
+function setToken(t) {
+  if (t) localStorage.setItem(TOKEN_KEY, t);
+  else localStorage.removeItem(TOKEN_KEY);
+}
+
 const api = {
   async request(url, options = {}) {
+    const token = getToken();
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = 'Bearer ' + token;
     const res = await fetch(API_BASE + url, {
-      headers: { 'Content-Type': 'application/json' },
-      ...options,
+      headers, ...options,
       body: options.body ? JSON.stringify(options.body) : undefined
     });
-    return res.json();
+    let data;
+    try { data = await res.json(); } catch (e) { data = {}; }
+    if (res.status === 401 || data.need_login) {
+      setToken(null);
+      localStorage.removeItem('user');
+      alert('登录已过期，请重新登录');
+      window.location.href = 'index.html';
+      throw new Error('need_login');
+    }
+    if (res.status === 403) {
+      alert(data.message || '无权限访问');
+      throw new Error('forbidden');
+    }
+    return data;
   },
-  login(username, password) {
-    return this.request('/login', { method: 'POST', body: { username, password } });
+  async login(username, password) {
+    const data = await this.request('/login', { method: 'POST', body: { username, password } });
+    if (data.success && data.token) setToken(data.token);
+    return data;
+  },
+  async logout() {
+    try { await this.request('/logout', { method: 'POST' }); } catch (e) {}
+    setToken(null);
+    localStorage.removeItem('user');
+    window.location.href = 'index.html';
   },
   getProducts() { return this.request('/products'); },
   getLockers() { return this.request('/lockers'); },
   getEmptyLockers() { return this.request('/lockers/empty'); },
-  getSubscriptions(residentId) {
-    return this.request('/subscriptions' + (residentId ? `?resident_id=${residentId}` : ''));
-  },
+  getSubscriptions() { return this.request('/subscriptions'); },
   createSubscription(data) {
     return this.request('/subscriptions', { method: 'POST', body: data });
   },
   cancelSubscription(id) {
     return this.request(`/subscriptions/${id}/cancel`, { method: 'PUT' });
   },
-  getBatches(deliveryPersonId, status) {
-    let qs = [];
-    if (deliveryPersonId) qs.push(`delivery_person_id=${deliveryPersonId}`);
-    if (status) qs.push(`status=${status}`);
-    return this.request('/batches' + (qs.length ? '?' + qs.join('&') : ''));
+  getBatches(status) {
+    return this.request('/batches' + (status ? `?status=${status}` : ''));
   },
   createBatch(data) {
     return this.request('/batches', { method: 'POST', body: data });
@@ -39,14 +67,14 @@ const api = {
   placeBatchItem(itemId, lockerId) {
     return this.request(`/batch-items/${itemId}/place`, { method: 'POST', body: { locker_id: lockerId } });
   },
-  getPickupItems(residentId) {
-    return this.request(`/resident/pickup-items?resident_id=${residentId}`);
+  getPickupItems() {
+    return this.request('/resident/pickup-items');
   },
-  pickup(data) {
-    return this.request('/pickup', { method: 'POST', body: data });
+  pickup(batch_item_id, pickup_code) {
+    return this.request('/pickup', { method: 'POST', body: { batch_item_id, pickup_code } });
   },
-  reportDamaged(data) {
-    return this.request('/report-damaged', { method: 'POST', body: data });
+  reportDamaged(batch_item_id, description) {
+    return this.request('/report-damaged', { method: 'POST', body: { batch_item_id, description } });
   },
   getExceptions(status, type) {
     let qs = [];
@@ -75,8 +103,11 @@ function getUser() {
 }
 
 function logout() {
-  localStorage.removeItem('user');
-  window.location.href = 'index.html';
+  api.logout().catch(() => {
+    setToken(null);
+    localStorage.removeItem('user');
+    window.location.href = 'index.html';
+  });
 }
 
 function todayStr() {

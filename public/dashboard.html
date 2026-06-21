@@ -111,7 +111,7 @@ async function renderPage() {
 PAGES.overview = async function() {
   const area = document.getElementById('contentArea');
   if (user.role === 'delivery') {
-    const [batches, lockers] = await Promise.all([api.getBatches(user.id), api.getLockers()]);
+    const [batches, lockers] = await Promise.all([api.getBatches(), api.getLockers()]);
     const inProgress = batches.batches.filter(b => b.status === 'in_progress').length;
     const occupied = lockers.lockers.filter(l => l.status === 'occupied').length;
     const empty = lockers.lockers.filter(l => l.status === 'empty').length;

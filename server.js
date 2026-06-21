@@ -4,6 +4,7 @@ const bodyParser = require('body-parser');
 const initSqlJs = require('sql.js');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = 3001;
@@ -13,22 +14,36 @@ app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 const dbPath = path.join(__dirname, 'milk-locker.db');
-
 let SQL, db;
 
-function rowsToObjects(result) {
-  if (!result || !result.length) return [];
-  const { columns, values } = result[0];
-  return values.map(row => {
-    const obj = {};
-    columns.forEach((col, i) => obj[col] = row[i]);
-    return obj;
-  });
+const activeTokens = new Map();
+
+function generateToken(userId) {
+  return crypto.randomBytes(24).toString('hex') + '.' + userId + '.' + Date.now();
 }
 
-function rowToObject(result) {
-  const rows = rowsToObjects(result);
-  return rows.length ? rows[0] : undefined;
+function authMiddleware(roles = []) {
+  return (req, res, next) => {
+    const authHeader = req.headers.authorization || req.headers['x-auth-token'];
+    if (!authHeader) {
+      return res.status(401).json({ success: false, message: '未登录，请先登录', need_login: true });
+    }
+    const token = authHeader.replace('Bearer ', '');
+    const tokenInfo = activeTokens.get(token);
+    if (!tokenInfo) {
+      return res.status(401).json({ success: false, message: '登录已过期，请重新登录', need_login: true });
+    }
+    if (tokenInfo.expireAt < Date.now()) {
+      activeTokens.delete(token);
+      return res.status(401).json({ success: false, message: '登录已过期，请重新登录', need_login: true });
+    }
+    if (roles.length && !roles.includes(tokenInfo.user.role)) {
+      return res.status(403).json({ success: false, message: '权限不足' });
+    }
+    req.user = tokenInfo.user;
+    req.token = token;
+    next();
+  };
 }
 
 function run(sql, params = []) {
@@ -44,12 +59,8 @@ function run(sql, params = []) {
 function queryAll(sql, params = []) {
   const stmt = db.prepare(sql);
   stmt.bind(params);
-  const columns = stmt.getColumnNames();
   const rows = [];
-  while (stmt.step()) {
-    const row = stmt.getAsObject();
-    rows.push(row);
-  }
+  while (stmt.step()) rows.push(stmt.getAsObject());
   stmt.free();
   return rows;
 }
@@ -96,17 +107,31 @@ app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
   const user = queryOne('SELECT * FROM users WHERE username = ? AND password = ?', [username, password]);
   if (user) {
-    res.json({ success: true, user: { id: user.id, username: user.username, role: user.role, name: user.name, phone: user.phone, address: user.address } });
-  } else {
-    res.json({ success: false, message: '用户名或密码错误' });
+    const token = generateToken(user.id);
+    const tokenInfo = {
+      user: { id: user.id, username: user.username, role: user.role, name: user.name, phone: user.phone, address: user.address },
+      expireAt: Date.now() + 24 * 60 * 60 * 1000
+    };
+    activeTokens.set(token, tokenInfo);
+    return res.json({
+      success: true,
+      token,
+      user: tokenInfo.user
+    });
   }
+  res.json({ success: false, message: '用户名或密码错误' });
 });
 
-app.get('/api/products', (req, res) => {
+app.post('/api/logout', authMiddleware(), (req, res) => {
+  activeTokens.delete(req.token);
+  res.json({ success: true });
+});
+
+app.get('/api/products', authMiddleware(), (req, res) => {
   res.json({ success: true, products: queryAll('SELECT * FROM milk_products') });
 });
 
-app.get('/api/lockers', (req, res) => {
+app.get('/api/lockers', authMiddleware(), (req, res) => {
   const lockers = queryAll(`
     SELECT l.*, bi.id as batch_item_id, bi.status as item_status, bi.resident_id, bi.product_id,
            mp.name as product_name, u.name as resident_name
@@ -119,11 +144,11 @@ app.get('/api/lockers', (req, res) => {
   res.json({ success: true, lockers });
 });
 
-app.get('/api/lockers/empty', (req, res) => {
+app.get('/api/lockers/empty', authMiddleware(), (req, res) => {
   res.json({ success: true, lockers: queryAll("SELECT * FROM lockers WHERE status = 'empty' ORDER BY locker_code") });
 });
 
-app.get('/api/subscriptions', (req, res) => {
+app.get('/api/subscriptions', authMiddleware(), (req, res) => {
   const { resident_id } = req.query;
   let sql = `
     SELECT s.*, mp.name as product_name, mp.brand, mp.spec, mp.price, u.name as resident_name
@@ -132,47 +157,67 @@ app.get('/api/subscriptions', (req, res) => {
     JOIN users u ON s.resident_id = u.id
   `;
   const params = [];
-  if (resident_id) { sql += ' WHERE s.resident_id = ?'; params.push(resident_id); }
+  if (req.user.role === 'resident') {
+    sql += ' WHERE s.resident_id = ?';
+    params.push(req.user.id);
+  } else if (resident_id) {
+    sql += ' WHERE s.resident_id = ?';
+    params.push(resident_id);
+  }
   sql += ' ORDER BY s.created_at DESC';
   res.json({ success: true, subscriptions: queryAll(sql, params) });
 });
 
-app.post('/api/subscriptions', (req, res) => {
+app.post('/api/subscriptions', authMiddleware(['resident', 'property', 'delivery']), (req, res) => {
   const { resident_id, product_id, quantity, start_date, end_date, weekdays } = req.body;
+  const actualResidentId = req.user.role === 'resident' ? req.user.id : resident_id;
+  if (!actualResidentId) return res.json({ success: false, message: '缺少住户ID' });
+
   const info = run(`INSERT INTO subscriptions (resident_id, product_id, quantity, start_date, end_date, weekdays) VALUES (?, ?, ?, ?, ?, ?)`,
-    [resident_id, product_id, quantity || 1, start_date, end_date || null, weekdays || '1,2,3,4,5,6,7']);
+    [actualResidentId, product_id, quantity || 1, start_date, end_date || null, weekdays || '1,2,3,4,5,6,7']);
   run(`INSERT INTO inventory_logs (product_id, change_quantity, change_type, reference_id, notes) VALUES (?, ?, 'subscribe', ?, '新增订奶')`,
     [product_id, quantity || 1, info.lastID]);
   res.json({ success: true, id: info.lastID });
 });
 
-app.put('/api/subscriptions/:id/cancel', (req, res) => {
+app.put('/api/subscriptions/:id/cancel', authMiddleware(), (req, res) => {
   const { id } = req.params;
   const sub = queryOne('SELECT * FROM subscriptions WHERE id = ?', [id]);
   if (!sub) return res.json({ success: false, message: '订奶记录不存在' });
+  if (req.user.role === 'resident' && sub.resident_id !== req.user.id) {
+    return res.status(403).json({ success: false, message: '权限不足' });
+  }
+
   run("UPDATE subscriptions SET status = 'cancelled' WHERE id = ?", [id]);
   run(`INSERT INTO inventory_logs (product_id, change_quantity, change_type, reference_id, notes) VALUES (?, ?, 'cancel_subscribe', ?, '取消订奶')`,
     [sub.product_id, -sub.quantity, id]);
+  const product = queryOne('SELECT price FROM milk_products WHERE id = ?', [sub.product_id]);
+  const price = product ? product.price : 5;
   run(`INSERT INTO settlements (resident_id, batch_item_id, exception_id, amount, type, status, description) VALUES (?, NULL, NULL, ?, 'refund', 'completed', '退订退款')`,
-    [sub.resident_id, 5 * sub.quantity]);
+    [sub.resident_id, price * sub.quantity]);
   res.json({ success: true });
 });
 
-app.get('/api/batches', (req, res) => {
+app.get('/api/batches', authMiddleware(['delivery', 'property']), (req, res) => {
   const { delivery_person_id, status } = req.query;
   let sql = `SELECT db.*, u.name as delivery_person_name FROM delivery_batches db JOIN users u ON db.delivery_person_id = u.id WHERE 1=1`;
   const params = [];
-  if (delivery_person_id) { sql += ' AND db.delivery_person_id = ?'; params.push(delivery_person_id); }
+  if (req.user.role === 'delivery') {
+    sql += ' AND db.delivery_person_id = ?';
+    params.push(req.user.id);
+  } else if (delivery_person_id) {
+    sql += ' AND db.delivery_person_id = ?';
+    params.push(delivery_person_id);
+  }
   if (status) { sql += ' AND db.status = ?'; params.push(status); }
   sql += ' ORDER BY db.created_at DESC LIMIT 50';
   res.json({ success: true, batches: queryAll(sql, params) });
 });
 
-app.post('/api/batches', (req, res) => {
-  const { delivery_person_id, batch_date } = req.query;
+app.post('/api/batches', authMiddleware(['delivery']), (req, res) => {
   const d = req.body;
-  const dpid = d.delivery_person_id || delivery_person_id;
-  const bdate = d.batch_date || batch_date || todayStr();
+  const dpid = req.user.id;
+  const bdate = d.batch_date || todayStr();
   const batch_no = generateBatchNo();
   const weekday = new Date(bdate).getDay() + 1;
   const activeSubs = queryAll(`SELECT s.* FROM subscriptions s WHERE s.status = 'active' AND s.start_date <= ? AND (s.end_date IS NULL OR s.end_date >= ?) AND s.weekdays LIKE ?`,
@@ -188,7 +233,7 @@ app.post('/api/batches', (req, res) => {
   res.json({ success: true, batch_id: batchId, batch_no, total_items: activeSubs.length });
 });
 
-app.get('/api/batches/:id/items', (req, res) => {
+app.get('/api/batches/:id/items', authMiddleware(['delivery', 'property']), (req, res) => {
   const items = queryAll(`
     SELECT bi.*, mp.name as product_name, mp.brand, mp.spec, mp.price, mp.shelf_life_hours,
            u.name as resident_name, u.phone, u.address, l.locker_code
@@ -202,26 +247,33 @@ app.get('/api/batches/:id/items', (req, res) => {
   res.json({ success: true, items });
 });
 
-app.post('/api/batch-items/:id/place', (req, res) => {
+app.post('/api/batch-items/:id/place', authMiddleware(['delivery']), (req, res) => {
   const { id } = req.params;
   const { locker_id } = req.body;
   const item = queryOne('SELECT bi.*, mp.shelf_life_hours FROM batch_items bi JOIN milk_products mp ON bi.product_id = mp.id WHERE bi.id = ?', [id]);
   if (!item) return res.json({ success: false, message: '批次项不存在' });
-  if (item.status !== 'pending') return res.json({ success: false, message: '该批次项状态不正确' });
+  
+  const validPlaceStatus = ['pending', 're_delivery_pending'];
+  if (!validPlaceStatus.includes(item.status)) {
+    return res.json({ success: false, message: '该批次项状态不正确，当前状态：' + item.status });
+  }
   const locker = queryOne('SELECT * FROM lockers WHERE id = ?', [locker_id]);
   if (!locker) return res.json({ success: false, message: '格口不存在' });
   if (locker.status !== 'empty') return res.json({ success: false, message: '格口已被占用' });
+
   const now = nowStr();
   const expireAt = addHours(now, item.shelf_life_hours);
   run(`UPDATE batch_items SET status = 'placed', locker_id = ?, placed_at = ?, expire_at = ? WHERE id = ?`, [locker_id, now, expireAt, id]);
   run(`UPDATE lockers SET status = 'occupied', current_batch_item_id = ? WHERE id = ?`, [id, locker_id]);
-  run(`UPDATE delivery_batches SET delivered_quantity = delivered_quantity + ? WHERE id = ?`, [item.quantity, item.batch_id]);
+  if (item.status === 'pending') {
+    run(`UPDATE delivery_batches SET delivered_quantity = delivered_quantity + ? WHERE id = ?`, [item.quantity, item.batch_id]);
+  }
   run(`INSERT INTO inventory_logs (product_id, change_quantity, change_type, reference_id, notes) VALUES (?, ?, 'place_locker', ?, '放入格口')`,
     [item.product_id, -item.quantity, id]);
   res.json({ success: true });
 });
 
-app.get('/api/resident/pickup-items', (req, res) => {
+app.get('/api/resident/pickup-items', authMiddleware(['resident']), (req, res) => {
   const items = queryAll(`
     SELECT bi.*, mp.name as product_name, mp.brand, mp.spec, mp.price,
            l.locker_code, l.location, db.batch_no, db.batch_date
@@ -231,12 +283,14 @@ app.get('/api/resident/pickup-items', (req, res) => {
     JOIN delivery_batches db ON bi.batch_id = db.id
     WHERE bi.resident_id = ? AND bi.status = 'placed'
     ORDER BY bi.placed_at DESC
-  `, [req.query.resident_id]);
+  `, [req.user.id]);
   res.json({ success: true, items });
 });
 
-app.post('/api/pickup', (req, res) => {
-  const { batch_item_id, resident_id, pickup_code } = req.body;
+app.post('/api/pickup', authMiddleware(['resident']), (req, res) => {
+  const { batch_item_id, pickup_code } = req.body;
+  const resident_id = req.user.id;
+
   const item = queryOne(`
     SELECT bi.*, l.id as locker_id, l.locker_code, mp.price, mp.shelf_life_hours
     FROM batch_items bi
@@ -244,11 +298,17 @@ app.post('/api/pickup', (req, res) => {
     JOIN milk_products mp ON bi.product_id = mp.id
     WHERE bi.id = ?
   `, [batch_item_id]);
+
   if (!item) return res.json({ success: false, message: '取货记录不存在' });
   if (item.status !== 'placed') return res.json({ success: false, message: '该商品状态不正确' });
+
+  if (item.pickup_code !== pickup_code) {
+    return res.json({ success: false, message: '取货码错误，请重新输入', code_error: true });
+  }
+
   let wrongPick = false;
   if (item.resident_id !== resident_id) wrongPick = true;
-  if (item.pickup_code !== pickup_code) wrongPick = true;
+
   const now = nowStr();
   if (wrongPick) {
     run(`UPDATE batch_items SET status = 'wrong_pick', picked_at = ? WHERE id = ?`, [now, batch_item_id]);
@@ -261,21 +321,28 @@ app.post('/api/pickup', (req, res) => {
       [batch_item_id, resident_id, item.locker_id, now, pickup_code]);
     run(`INSERT INTO inventory_logs (product_id, change_quantity, change_type, reference_id, notes) VALUES (?, ?, 'wrong_pick', ?, '错拿出库')`,
       [item.product_id, -item.quantity, batch_item_id]);
-  } else {
-    run(`UPDATE batch_items SET status = 'picked', picked_at = ? WHERE id = ?`, [now, batch_item_id]);
-    run(`UPDATE lockers SET status = 'empty', current_batch_item_id = NULL WHERE id = ?`, [item.locker_id]);
-    run(`INSERT INTO pickup_records (batch_item_id, resident_id, locker_id, pickup_time, pickup_code_used, status) VALUES (?, ?, ?, ?, ?, 'success')`,
-      [batch_item_id, resident_id, item.locker_id, now, pickup_code]);
-    run(`INSERT INTO settlements (resident_id, batch_item_id, exception_id, amount, type, status, description) VALUES (?, ?, NULL, ?, 'charge', 'completed', '正常取货扣费')`,
-      [resident_id, batch_item_id, item.price * item.quantity]);
+    return res.json({ success: true, wrong_pick: true, message: '已记录错拿，原住户将获得补送或退款' });
   }
-  res.json({ success: true, wrong_pick: wrongPick });
+
+  run(`UPDATE batch_items SET status = 'picked', picked_at = ? WHERE id = ?`, [now, batch_item_id]);
+  run(`UPDATE lockers SET status = 'empty', current_batch_item_id = NULL WHERE id = ?`, [item.locker_id]);
+  run(`INSERT INTO pickup_records (batch_item_id, resident_id, locker_id, pickup_time, pickup_code_used, status) VALUES (?, ?, ?, ?, ?, 'success')`,
+    [batch_item_id, resident_id, item.locker_id, now, pickup_code]);
+  run(`INSERT INTO settlements (resident_id, batch_item_id, exception_id, amount, type, status, description) VALUES (?, ?, NULL, ?, 'charge', 'completed', '正常取货扣费')`,
+    [resident_id, batch_item_id, item.price * item.quantity]);
+  res.json({ success: true, wrong_pick: false });
 });
 
-app.post('/api/report-damaged', (req, res) => {
-  const { batch_item_id, resident_id, description } = req.body;
+app.post('/api/report-damaged', authMiddleware(['resident']), (req, res) => {
+  const { batch_item_id, description } = req.body;
+  const resident_id = req.user.id;
   const item = queryOne('SELECT bi.*, mp.price FROM batch_items bi JOIN milk_products mp ON bi.product_id = mp.id WHERE bi.id = ?', [batch_item_id]);
   if (!item) return res.json({ success: false, message: '记录不存在' });
+  if (item.resident_id !== resident_id) return res.status(403).json({ success: false, message: '权限不足' });
+  if (!['placed', 'picked'].includes(item.status)) {
+    return res.json({ success: false, message: '当前状态无法上报破损' });
+  }
+
   const now = nowStr();
   run(`UPDATE batch_items SET status = 'damaged' WHERE id = ?`, [batch_item_id]);
   if (item.locker_id) run(`UPDATE lockers SET status = 'empty', current_batch_item_id = NULL WHERE id = ?`, [item.locker_id]);
@@ -288,11 +355,12 @@ app.post('/api/report-damaged', (req, res) => {
   res.json({ success: true });
 });
 
-app.get('/api/exceptions', (req, res) => {
+app.get('/api/exceptions', authMiddleware(['property', 'delivery']), (req, res) => {
   const { status, type } = req.query;
   let sql = `
-    SELECT e.*, bi.resident_id, bi.product_id, u.name as resident_name,
-           mp.name as product_name, db.batch_no, l.locker_code
+    SELECT e.*, bi.resident_id, bi.product_id, bi.quantity as item_quantity, bi.batch_id,
+           u.name as resident_name, u.phone, u.address,
+           mp.name as product_name, mp.shelf_life_hours, db.batch_no, l.locker_code
     FROM exceptions e
     JOIN batch_items bi ON e.batch_item_id = bi.id
     JOIN users u ON bi.resident_id = u.id
@@ -308,28 +376,70 @@ app.get('/api/exceptions', (req, res) => {
   res.json({ success: true, exceptions: queryAll(sql, params) });
 });
 
-app.post('/api/exceptions/:id/resolve', (req, res) => {
+app.post('/api/exceptions/:id/resolve', authMiddleware(['property', 'delivery']), (req, res) => {
   const { id } = req.params;
-  const { handled_by, action, notes } = req.body;
-  const exc = queryOne('SELECT * FROM exceptions WHERE id = ?', [id]);
+  const { action, notes } = req.body;
+  const handled_by = req.user.id;
+
+  const exc = queryOne(`
+    SELECT e.*, bi.resident_id, bi.product_id, bi.quantity, bi.batch_id, bi.subscription_id,
+           mp.shelf_life_hours
+    FROM exceptions e
+    JOIN batch_items bi ON e.batch_item_id = bi.id
+    JOIN milk_products mp ON bi.product_id = mp.id
+    WHERE e.id = ?
+  `, [id]);
   if (!exc) return res.json({ success: false, message: '异常记录不存在' });
+  if (exc.status === 'resolved') return res.json({ success: false, message: '该异常已处理' });
+
   const now = nowStr();
   run(`UPDATE exceptions SET status = 'resolved', handled_by = ?, handled_at = ? WHERE id = ?`, [handled_by, now, id]);
   run(`UPDATE settlements SET status = 'completed', description = COALESCE(description, '') || ? WHERE exception_id = ?`,
     [notes ? ` (${notes})` : '', id]);
-  if (action === 're_deliver') {
-    const item = queryOne('SELECT * FROM batch_items WHERE id = ?', [exc.batch_item_id]);
-    run(`UPDATE batch_items SET status = 're_delivered' WHERE id = ?`, [exc.batch_item_id]);
-    run(`INSERT INTO inventory_logs (product_id, change_quantity, change_type, reference_id, notes) VALUES (?, ?, 're_delivery', ?, '补送出库')`,
-      [item.product_id, -item.quantity, exc.batch_item_id]);
-  }
+
   if (action === 'refund') {
     run(`UPDATE batch_items SET status = 'returned' WHERE id = ?`, [exc.batch_item_id]);
   }
+
+  if (action === 're_deliver') {
+    const newPickupCode = generatePickupCode();
+    const newItemId = run(`
+      INSERT INTO batch_items (batch_id, subscription_id, product_id, quantity, resident_id, pickup_code, status, source_exception_id)
+      VALUES (?, ?, ?, ?, ?, ?, 're_delivery_pending', ?)
+    `, [exc.batch_id, exc.subscription_id, exc.product_id, exc.quantity, exc.resident_id, newPickupCode, id]).lastID;
+
+    run(`UPDATE batch_items SET status = 're_delivered', re_delivered_to_item_id = ? WHERE id = ?`, [newItemId, exc.batch_item_id]);
+    run(`INSERT INTO inventory_logs (product_id, change_quantity, change_type, reference_id, notes) VALUES (?, ?, 're_delivery_create', ?, '补送新建')`,
+      [exc.product_id, 0, newItemId]);
+
+    const reExcId = run(`
+      INSERT INTO exceptions (batch_item_id, type, description, status, impact_inventory, impact_settlement, source_resolved_exception_id)
+      VALUES (?, 're_delivery', ?, 'pending', 0, 0, ?)
+    `, [newItemId, '补送待投放', id]).lastID;
+
+    run(`UPDATE batch_items SET re_delivery_exception_id = ? WHERE id = ?`, [reExcId, newItemId]);
+  }
+
   res.json({ success: true });
 });
 
-app.post('/api/check-expired', (req, res) => {
+app.get('/api/delivery/re-delivery-items', authMiddleware(['delivery', 'property']), (req, res) => {
+  const items = queryAll(`
+    SELECT bi.*, mp.name as product_name, mp.brand, mp.spec, mp.price, mp.shelf_life_hours,
+           u.name as resident_name, u.phone, u.address, l.locker_code,
+           e.id as re_delivery_exception_id
+    FROM batch_items bi
+    JOIN milk_products mp ON bi.product_id = mp.id
+    JOIN users u ON bi.resident_id = u.id
+    LEFT JOIN lockers l ON bi.locker_id = l.id
+    LEFT JOIN exceptions e ON e.batch_item_id = bi.id AND e.type = 're_delivery' AND e.status = 'pending'
+    WHERE bi.status = 're_delivery_pending'
+    ORDER BY bi.created_at DESC
+  `);
+  res.json({ success: true, items });
+});
+
+app.post('/api/check-expired', authMiddleware(['property', 'delivery']), (req, res) => {
   const now = nowStr();
   const expiredItems = queryAll(`
     SELECT bi.*, mp.price FROM batch_items bi
@@ -351,19 +461,22 @@ app.post('/api/check-expired', (req, res) => {
   res.json({ success: true, expired_count: count });
 });
 
-app.get('/api/daily-report', (req, res) => {
+app.get('/api/daily-report', authMiddleware(['property', 'delivery']), (req, res) => {
   const reportDate = req.query.date || todayStr();
   const q = (sql, p) => queryOne(sql, p) || {};
-  const delivered = q(`SELECT COUNT(*) as cnt, COALESCE(SUM(bi.quantity), 0) as qty FROM batch_items bi JOIN delivery_batches db ON bi.batch_id = db.id WHERE db.batch_date = ? AND bi.status != 'pending'`, [reportDate]);
+  const delivered = q(`SELECT COUNT(*) as cnt, COALESCE(SUM(bi.quantity), 0) as qty FROM batch_items bi JOIN delivery_batches db ON bi.batch_id = db.id WHERE db.batch_date = ? AND bi.status NOT IN ('pending', 're_delivery_pending')`, [reportDate]);
   const picked = q(`SELECT COUNT(*) as cnt, COALESCE(SUM(bi.quantity), 0) as qty FROM batch_items bi JOIN delivery_batches db ON bi.batch_id = db.id WHERE db.batch_date = ? AND bi.status = 'picked'`, [reportDate]);
   const expired = q(`SELECT COUNT(*) as cnt, COALESCE(SUM(bi.quantity), 0) as qty FROM batch_items bi JOIN delivery_batches db ON bi.batch_id = db.id WHERE db.batch_date = ? AND bi.status = 'expired'`, [reportDate]);
   const damaged = q(`SELECT COUNT(*) as cnt, COALESCE(SUM(bi.quantity), 0) as qty FROM batch_items bi JOIN delivery_batches db ON bi.batch_id = db.id WHERE db.batch_date = ? AND bi.status = 'damaged'`, [reportDate]);
   const wrongPick = q(`SELECT COUNT(*) as cnt, COALESCE(SUM(bi.quantity), 0) as qty FROM batch_items bi JOIN delivery_batches db ON bi.batch_id = db.id WHERE db.batch_date = ? AND bi.status = 'wrong_pick'`, [reportDate]);
   const reDelivered = q(`SELECT COUNT(*) as cnt, COALESCE(SUM(bi.quantity), 0) as qty FROM batch_items bi JOIN delivery_batches db ON bi.batch_id = db.id WHERE db.batch_date = ? AND bi.status = 're_delivered'`, [reportDate]);
+  const reDeliveryPending = q(`SELECT COUNT(*) as cnt, COALESCE(SUM(bi.quantity), 0) as qty FROM batch_items bi JOIN delivery_batches db ON bi.batch_id = db.id WHERE db.batch_date = ? AND bi.status = 're_delivery_pending'`, [reportDate]);
   const refunded = q(`SELECT COUNT(*) as cnt, COALESCE(SUM(bi.quantity), 0) as qty FROM batch_items bi JOIN delivery_batches db ON bi.batch_id = db.id WHERE db.batch_date = ? AND bi.status = 'returned'`, [reportDate]);
-  const remaining = queryAll(`SELECT bi.id, bi.status, bi.quantity, mp.name as product_name, u.name as resident_name, l.locker_code, bi.expire_at FROM batch_items bi JOIN delivery_batches db ON bi.batch_id = db.id JOIN milk_products mp ON bi.product_id = mp.id JOIN users u ON bi.resident_id = u.id LEFT JOIN lockers l ON bi.locker_id = l.id WHERE db.batch_date = ? AND bi.status IN ('placed', 'pending') ORDER BY bi.status`, [reportDate]);
+
+  const remaining = queryAll(`SELECT bi.id, bi.status, bi.quantity, mp.name as product_name, u.name as resident_name, l.locker_code, bi.expire_at FROM batch_items bi JOIN delivery_batches db ON bi.batch_id = db.id JOIN milk_products mp ON bi.product_id = mp.id JOIN users u ON bi.resident_id = u.id LEFT JOIN lockers l ON bi.locker_id = l.id WHERE db.batch_date = ? AND bi.status IN ('placed', 'pending', 're_delivery_pending') ORDER BY bi.status`, [reportDate]);
   const exceptionDetails = queryAll(`SELECT e.type, e.status, e.description, e.impact_inventory, e.impact_settlement, mp.name as product_name, u.name as resident_name FROM exceptions e JOIN batch_items bi ON e.batch_item_id = bi.id JOIN delivery_batches db ON bi.batch_id = db.id JOIN milk_products mp ON bi.product_id = mp.id JOIN users u ON bi.resident_id = u.id WHERE db.batch_date = ? ORDER BY e.type`, [reportDate]);
   const settlements = queryAll(`SELECT s.*, u.name as resident_name FROM settlements s LEFT JOIN users u ON s.resident_id = u.id WHERE DATE(s.created_at) = ? ORDER BY s.created_at DESC`, [reportDate]);
+
   res.json({
     success: true,
     report: {
@@ -374,6 +487,7 @@ app.get('/api/daily-report', (req, res) => {
       total_damaged: damaged.qty || 0,
       total_wrong_pick: wrongPick.qty || 0,
       total_re_delivered: reDelivered.qty || 0,
+      total_re_delivery_pending: reDeliveryPending.qty || 0,
       total_refunded: refunded.qty || 0,
       remaining_products: remaining,
       exception_details: exceptionDetails,
@@ -382,19 +496,25 @@ app.get('/api/daily-report', (req, res) => {
   });
 });
 
-app.get('/api/residents', (req, res) => {
+app.get('/api/residents', authMiddleware(['property', 'delivery']), (req, res) => {
   res.json({ success: true, residents: queryAll("SELECT id, name, phone, address FROM users WHERE role = 'resident' ORDER BY name") });
 });
 
-app.get('/api/inventory-logs', (req, res) => {
+app.get('/api/inventory-logs', authMiddleware(['property']), (req, res) => {
   res.json({ success: true, logs: queryAll(`SELECT il.*, mp.name as product_name FROM inventory_logs il JOIN milk_products mp ON il.product_id = mp.id ORDER BY il.created_at DESC LIMIT 100`) });
 });
 
-app.get('/api/settlements', (req, res) => {
+app.get('/api/settlements', authMiddleware(), (req, res) => {
   const { resident_id } = req.query;
   let sql = `SELECT s.*, u.name as resident_name FROM settlements s LEFT JOIN users u ON s.resident_id = u.id`;
   const params = [];
-  if (resident_id) { sql += ' WHERE s.resident_id = ?'; params.push(resident_id); }
+  if (req.user.role === 'resident') {
+    sql += ' WHERE s.resident_id = ?';
+    params.push(req.user.id);
+  } else if (resident_id) {
+    sql += ' WHERE s.resident_id = ?';
+    params.push(resident_id);
+  }
   sql += ' ORDER BY s.created_at DESC LIMIT 100';
   res.json({ success: true, settlements: queryAll(sql, params) });
 });
@@ -405,11 +525,28 @@ app.get('/api/settlements', (req, res) => {
     const fileBuffer = fs.readFileSync(dbPath);
     db = new SQL.Database(fileBuffer);
     console.log('数据库已加载');
+    try {
+      queryOne("SELECT name FROM sqlite_master WHERE type='column' AND tbl_name='batch_items' AND name='source_exception_id'");
+    } catch(e) {}
+    try {
+      const cols = queryAll("PRAGMA table_info(batch_items)").map(c => c.name);
+      if (!cols.includes('source_exception_id')) {
+        run('ALTER TABLE batch_items ADD COLUMN source_exception_id INTEGER');
+        run('ALTER TABLE batch_items ADD COLUMN re_delivered_to_item_id INTEGER');
+        run('ALTER TABLE batch_items ADD COLUMN re_delivery_exception_id INTEGER');
+        console.log('已升级 batch_items 表结构');
+      }
+      const excCols = queryAll("PRAGMA table_info(exceptions)").map(c => c.name);
+      if (!excCols.includes('source_resolved_exception_id')) {
+        run('ALTER TABLE exceptions ADD COLUMN source_resolved_exception_id INTEGER');
+        console.log('已升级 exceptions 表结构');
+      }
+    } catch(e) { console.log('表升级跳过:', e.message); }
   } else {
     console.log('数据库不存在，正在初始化...');
     db = new SQL.Database();
     require('./init-db.js');
-    await new Promise(r => setTimeout(r, 1000));
+    await new Promise(r => setTimeout(r, 1500));
     if (fs.existsSync(dbPath)) {
       const fileBuffer = fs.readFileSync(dbPath);
       db = new SQL.Database(fileBuffer);
@@ -418,5 +555,4 @@ app.get('/api/settlements', (req, res) => {
   app.listen(PORT, () => {
     console.log(`鲜奶取货柜系统已启动: http://localhost:${PORT}`);
   });
-
 })();
